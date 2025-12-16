@@ -1,18 +1,29 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
+from multiprocessing import Pool
+import os
+import warnings
+from collections import deque 
 
-# --- GENETİK ALGORİTMA PARAMETRELERİ ---
-POPULATION_SIZE = 300         
-MUTATION_RATE = 0.08           
-MUTATION_STRENGTH = 0.15       
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# --- GENETIC ALGORITHM PARAMETERS ---
+NUM_PROCESSES = max(1, os.cpu_count() - 1)
+POPULATION_SIZE = 400         
+MUTATION_RATE = 0.07          # Lowered slightly to preserve "smart" behaviors
+MUTATION_STRENGTH = 0.2       
 MAX_GENERATIONS = 200          
-INPUT_SIZE = 17                
-HIDDEN_SIZE = 32               
+
+# === ARCHITECTURE CHANGES ===
+INPUT_SIZE = 19               # CHANGED: 14 -> 19 (Flood Fill + Body Size + Tail)
+HIDDEN_SIZE = 128             # Keep 128 for brain capacity
 OUTPUT_SIZE = 3
 
 # ----------------------------------------------------------
-# NÖRON AĞI
+# NEURAL NETWORK
 # ----------------------------------------------------------
 
 class NeuralNetwork:
@@ -21,7 +32,6 @@ class NeuralNetwork:
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-        # Xavier değil! GA için uniform daha stabil.
         self.weights1 = np.random.uniform(-1, 1, (input_size, hidden_size))
         self.bias1 = np.random.uniform(-1, 1, (1, hidden_size))
         
@@ -33,10 +43,8 @@ class NeuralNetwork:
     
     def predict(self, input_data):
         input_data = input_data.reshape(1, -1)
-
         hidden = self.relu(np.dot(input_data, self.weights1) + self.bias1)
         output = np.dot(hidden, self.weights2) + self.bias2
-
         action = [0,0,0]
         action[np.argmax(output)] = 1
         return action
@@ -74,17 +82,13 @@ class NeuralNetwork:
         return child
 
 # ----------------------------------------------------------
-# STATE FONKSİYONU (16 INPUT)
+# STATE FUNCTION (19 INPUTS: Flood + Size + Tail)
 # ----------------------------------------------------------
 
 def get_state(game):
     head = game.snake[0]
-
-    total_grid_size = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
-    normalized_length = len(game.snake) / total_grid_size
+    tail = game.snake[-1]
     
-    state.append(normalized_length)
-
     point_l = Point(head.x - BLOCK_SIZE, head.y)
     point_r = Point(head.x + BLOCK_SIZE, head.y)
     point_u = Point(head.x, head.y - BLOCK_SIZE)
@@ -95,126 +99,145 @@ def get_state(game):
     dir_u = game.direction == Direction.UP
     dir_d = game.direction == Direction.DOWN
 
-    # --- Tehlikeler ---
+    occupied = set((p.x, p.y) for p in game.snake)
+
+    # --- 1. Flood Fill Logic ---
+    def get_accessible_area(start_point):
+        if (start_point.x < 0 or start_point.x >= game.w or 
+            start_point.y < 0 or start_point.y >= game.h or 
+            (start_point.x, start_point.y) in occupied):
+            return 0.0
+
+        visited = set()
+        queue = deque([(start_point.x, start_point.y)])
+        visited.add((start_point.x, start_point.y))
+        count = 0
+        MAX_SEARCH = 80 
+        
+        while queue and count < MAX_SEARCH:
+            cx, cy = queue.popleft()
+            count += 1
+            neighbors = [
+                (cx - BLOCK_SIZE, cy), (cx + BLOCK_SIZE, cy),
+                (cx, cy - BLOCK_SIZE), (cx, cy + BLOCK_SIZE)
+            ]
+            for nx, ny in neighbors:
+                if (0 <= nx < game.w and 0 <= ny < game.h and 
+                    (nx, ny) not in occupied and (nx, ny) not in visited):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        return count / MAX_SEARCH
+
+    # Relative Directions
     if dir_r:
-        danger_straight = game.is_collision(point_r)
-        danger_right = game.is_collision(point_d)
-        danger_left = game.is_collision(point_u)
+        p_straight, p_right, p_left = point_r, point_d, point_u
     elif dir_l:
-        danger_straight = game.is_collision(point_l)
-        danger_right = game.is_collision(point_u)
-        danger_left = game.is_collision(point_d)
+        p_straight, p_right, p_left = point_l, point_u, point_d
     elif dir_u:
-        danger_straight = game.is_collision(point_u)
-        danger_right = game.is_collision(point_r)
-        danger_left = game.is_collision(point_l)
+        p_straight, p_right, p_left = point_u, point_r, point_l
     else: # dir_d
-        danger_straight = game.is_collision(point_d)
-        danger_right = game.is_collision(point_l)
-        danger_left = game.is_collision(point_r)
+        p_straight, p_right, p_left = point_d, point_l, point_r
+        
+    # --- New Inputs Calculations ---
+    total_grid_size = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
+    norm_length = len(game.snake) / total_grid_size
 
+    # --- 2. Construct State Vector ---
     state = [
-        int(danger_straight),
-        int(danger_right),
-        int(danger_left)
+        # Danger (3)
+        (dir_r and game.is_collision(point_r)) or (dir_l and game.is_collision(point_l)) or (dir_u and game.is_collision(point_u)) or (dir_d and game.is_collision(point_d)),
+        (dir_u and game.is_collision(point_r)) or (dir_d and game.is_collision(point_l)) or (dir_l and game.is_collision(point_u)) or (dir_r and game.is_collision(point_d)),
+        (dir_d and game.is_collision(point_r)) or (dir_u and game.is_collision(point_l)) or (dir_r and game.is_collision(point_u)) or (dir_l and game.is_collision(point_d)),
+
+        # Direction (4)
+        dir_l, dir_r, dir_u, dir_d,
+
+        # Food (4)
+        game.food.x < head.x, game.food.x > head.x,
+        game.food.y < head.y, game.food.y > head.y,
+        
+        # Flood Fill (3)
+        get_accessible_area(p_straight),
+        get_accessible_area(p_right),
+        get_accessible_area(p_left),
+        
+        # NEW: Body Size (1)
+        norm_length,
+
+        # NEW: Tail Direction (4)
+        tail.x < head.x, # Tail Left
+        tail.x > head.x, # Tail Right
+        tail.y < head.y, # Tail Up
+        tail.y > head.y  # Tail Down
     ]
-
-    # ---- Raycasting: 3 mesafe ---
-    if dir_r: directions = [Point(BLOCK_SIZE,0), Point(0,BLOCK_SIZE), Point(0,-BLOCK_SIZE)]
-    elif dir_l: directions = [Point(-BLOCK_SIZE,0), Point(0,-BLOCK_SIZE), Point(0,BLOCK_SIZE)]
-    elif dir_u: directions = [Point(0,-BLOCK_SIZE), Point(BLOCK_SIZE,0), Point(-BLOCK_SIZE,0)]
-    else: directions = [Point(0,BLOCK_SIZE), Point(-BLOCK_SIZE,0), Point(BLOCK_SIZE,0)]
-
-    for d in directions:
-        dist = 1
-        cur = Point(head.x, head.y)
-        while dist < 20:
-            cur = Point(cur.x + d.x, cur.y + d.y)
-            if game.is_collision(cur):
-                break
-            dist += 1
-        state.append(1 / dist)
-
-    # --- Yön ---
-    state.extend([int(dir_l), int(dir_r), int(dir_u), int(dir_d)])
-
-    # --- Yemek pozisyonu ---
-    food = game.food
-    state.extend([
-        int(food.x < head.x),
-        int(food.x > head.x),
-        int(food.y < head.y),
-        int(food.y > head.y),
-    ])
-
-    # --- Alan kontrolü (Space awareness) ---
-    def measure_space(start, direction):
-        space = 0
-        cur = start
-        for _ in range(5):
-            cur = Point(cur.x + direction.x, cur.y + direction.y)
-            if game.is_collision(cur): break
-            space += 1
-        return space / 5.0
-
-    if dir_r: vec_left, vec_right = Point(0,-BLOCK_SIZE), Point(0,BLOCK_SIZE)
-    elif dir_l: vec_left, vec_right = Point(0,BLOCK_SIZE), Point(0,-BLOCK_SIZE)
-    elif dir_u: vec_left, vec_right = Point(-BLOCK_SIZE,0), Point(BLOCK_SIZE,0)
-    else: vec_left, vec_right = Point(BLOCK_SIZE,0), Point(-BLOCK_SIZE,0)
-
-    state.append(measure_space(head, vec_left))
-    state.append(measure_space(head, vec_right))
 
     return np.array(state, dtype=float)
 
 # ----------------------------------------------------------
-# FITNESS (Optimize Edilmiş)
+# FITNESS
 # ----------------------------------------------------------
 
-def evaluate_agent(nn, render=False):
-    game = SnakeGameAI(w=640, h=480, render_mode=render)
+def evaluate_agent(nn, render=False, display_speed_multiplier=1):
+    game = SnakeGameAI(w=640, h=480, render_mode=render, display_speed_multiplier=display_speed_multiplier)
     game.reset()
 
     steps = 0
-    max_steps = 120
+    max_steps = 150 # Increased
 
     while True:
         state = get_state(game)
         action = nn.predict(state)
-
         reward, game_over, score = game.play_step(action)
-
         steps += 1
-        max_steps = 120 + score * 40
+        
+        if score > 0:
+            max_steps = 150 + (score * 100)
 
         if game_over or steps > max_steps:
             break
 
-    # ---- Fitness ----
-    return score * 500 + steps, score
+    # CHANGED: Replaced 2**score with score**3 to prevent explosion
+    fitness = (score ** 3) * 100 + steps + (score * 500)
+    return max(0.1, fitness), score
+
+def evaluate_agent_wrapper(nn):
+    return evaluate_agent(nn, render=False)
 
 # ----------------------------------------------------------
-# GA İŞLEMLERİ
+# GA OPERATIONS
 # ----------------------------------------------------------
 
 def select_best(population, fitnesses):
     order = np.argsort(fitnesses)[::-1]
     return [population[i] for i in order]
 
-def next_generation(best, population_size):
+def next_generation(best_agents, population_size, all_time_best):
     new = []
 
-    # --- Elitizm ---
-    elite = best[0]
-    for _ in range(5):
-        new.append(elite.copy())
+    # --- 1. Absolute Elitism ---
+    # Ensure the All-Time Best is always preserved (2 copies)
+    if all_time_best:
+        new.append(all_time_best.copy())
+        new.append(all_time_best.copy())
 
-    # --- Parent havuzu: %10 ---
-    top_pool = best[: max(2, population_size // 10)]
+    # --- 2. Current Generation Elitism ---
+    # Keep top 3 from current generation
+    for i in range(3):
+        if len(new) < population_size:
+            new.append(best_agents[i].copy())
+
+    # --- 3. Crossover & Mutation ---
+    # Parents come from the top 20%
+    parent_pool_size = max(2, int(population_size * 0.2))
+    parent_pool = best_agents[:parent_pool_size]
+    
+    # Add all-time best to the breeding pool as well
+    if all_time_best:
+        parent_pool.append(all_time_best)
 
     while len(new) < population_size:
-        p1 = np.random.choice(top_pool)
-        p2 = np.random.choice(top_pool)
+        p1 = np.random.choice(parent_pool)
+        p2 = np.random.choice(parent_pool)
         
         child = NeuralNetwork.crossover(p1, p2)
         child.mutate()
@@ -223,56 +246,71 @@ def next_generation(best, population_size):
     return new
 
 # ----------------------------------------------------------
-# ANA EĞİTİM DÖNGÜSÜ
+# MAIN LOOP
 # ----------------------------------------------------------
 
 def main():
+    print(f"Starting Genetic Algorithm with {NUM_PROCESSES} parallel processes...")
+    print(f"Population: {POPULATION_SIZE}, Generations: {MAX_GENERATIONS}")
+    print(f"Structure: {INPUT_SIZE} -> {HIDDEN_SIZE} -> {OUTPUT_SIZE}")
+    print("-" * 60)
+    
     population = [NeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(POPULATION_SIZE)]
+    
     best_scores = []
     avg_scores = []
     gens = []
+    
+    all_time_best = None
+    all_time_best_score = -1
 
     for gen in range(1, MAX_GENERATIONS + 1):
-        fitnesses = []
-        scores = []
+        with Pool(processes=NUM_PROCESSES) as pool:
+            results = pool.map(evaluate_agent_wrapper, population)
+        
+        fitnesses = np.array([r[0] for r in results])
+        scores = np.array([r[1] for r in results])
 
-        for nn in population:
-            fit, sc = evaluate_agent(nn)
-            fitnesses.append(fit)
-            scores.append(sc)
+        current_best_score = np.max(scores)
+        avg_score = np.mean(scores)
+        
+        best_agent_idx = np.argmax(scores)
+        current_best_agent = population[best_agent_idx]
 
-        best = max(scores)
-        avg = np.mean(scores)
+        # Update All-Time Best
+        if current_best_score > all_time_best_score:
+            all_time_best_score = current_best_score
+            all_time_best = current_best_agent.copy()
+            print(f"\n>>> NEW RECORD: {all_time_best_score} <<<")
 
-        best_scores.append(best)
-        avg_scores.append(avg)
+        best_scores.append(current_best_score)
+        avg_scores.append(avg_score)
         gens.append(gen)
 
-        print(f"Gen {gen:3d} | Best Score: {best:3d} | Avg: {avg:.2f}")
+        print(f"Gen {gen:3d} | Best: {current_best_score:3d} (Record: {all_time_best_score}) | Avg: {avg_score:.2f}")
 
-        best_agents = select_best(population, fitnesses)
+        # Evolution step
+        sorted_pop = select_best(population, fitnesses)
         if gen < MAX_GENERATIONS:
-            population = next_generation(best_agents, POPULATION_SIZE)
+            population = next_generation(sorted_pop, POPULATION_SIZE, all_time_best)
 
-    # Grafik kaydet
+    # Plot
     plt.figure(figsize=(10,6))
-    plt.plot(gens, best_scores, label="Best Score")
-    plt.plot(gens, avg_scores, label="Average Score")
+    plt.plot(gens, best_scores, label="Best (Current Gen)")
+    plt.plot(gens, avg_scores, label="Average")
+    plt.title("Genetic Algorithm Training (Flood+Tail)")
+    plt.xlabel("Generation")
+    plt.ylabel("Score")
     plt.legend()
-    plt.savefig("ga_training.png")
+    plt.savefig("ga_training_v3.png")
 
-    print("Training Complete!")
+    print(f"\nTraining Complete! All-time Best: {all_time_best_score}")
 
-    # En iyi 5'i izleme
-    top5 = best_agents[:5]
     while True:
-        cmd = input("\nWatch the top agent? (y/n): ").lower()
-        if cmd != "y":
-            break
-        for i, agent in enumerate(top5):
-            print(f"> Agent #{i+1}")
-            _, s = evaluate_agent(agent, render=True)
-            print("Score:", s)
+        cmd = input("\nWatch (b)est all time, or (q)uit? ").lower()
+        if cmd == 'q': break
+        if cmd == 'b' and all_time_best:
+            evaluate_agent(all_time_best, render=True, display_speed_multiplier=5)
 
 if __name__ == "__main__":
     main()

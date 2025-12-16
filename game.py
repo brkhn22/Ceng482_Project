@@ -4,8 +4,8 @@ from enum import Enum
 from collections import namedtuple
 import numpy as np
 
-pygame.init()
-font = pygame.font.Font(None, 25)
+# Don't initialize pygame globally - let each process do it when needed
+# pygame.init() will be called only when rendering
 
 # Constants
 BLOCK_SIZE = 40
@@ -40,10 +40,13 @@ class SnakeGameAI:
         
         # Initialize display only if rendering is enabled
         if self.render_mode:
+            pygame.init()  # Initialize pygame only when rendering
+            self.font = pygame.font.Font(None, 25)
             self.display = pygame.display.set_mode((self.w, self.h))
             pygame.display.set_caption('Snake AI')
             self.clock = pygame.time.Clock()
         else:
+            self.font = None
             self.display = None
             self.clock = None
             
@@ -64,20 +67,36 @@ class SnakeGameAI:
         self.frame_iteration = 0
         
     def _place_food(self):
-        x = random.randint(0, (self.w-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        y = random.randint(0, (self.h-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        self.food = Point(x, y)
-        if self.food in self.snake:
-            self._place_food()
+        # Prevent infinite recursion when board is almost full
+        max_attempts = 100
+        for _ in range(max_attempts):
+            x = random.randint(0, (self.w-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
+            y = random.randint(0, (self.h-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
+            self.food = Point(x, y)
+            if self.food not in self.snake:
+                return
+        
+        # If we can't find a spot after 100 tries, find any empty spot
+        for x in range(0, self.w, BLOCK_SIZE):
+            for y in range(0, self.h, BLOCK_SIZE):
+                pt = Point(x, y)
+                if pt not in self.snake:
+                    self.food = pt
+                    return
+        
+        # Board is completely full - game won (extremely rare)
+        # Just place food on head, game will end naturally
+        self.food = self.snake[0]
             
     def play_step(self, action):
         self.frame_iteration += 1
         
-        # 1. Collect user input
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                quit()
+        # 1. Collect user input (only when rendering)
+        if self.render_mode:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    quit()
         
         # 2. Move
         self._move(action) # update the head
@@ -162,7 +181,7 @@ class SnakeGameAI:
         
         pygame.draw.rect(self.display, RED, pygame.Rect(self.food.x, self.food.y, BLOCK_SIZE, BLOCK_SIZE))
         
-        text = font.render("Score: " + str(self.score), True, WHITE)
+        text = self.font.render("Score: " + str(self.score), True, WHITE)
         self.display.blit(text, [0, 0])
         pygame.display.flip()
     

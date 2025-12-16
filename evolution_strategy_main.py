@@ -1,22 +1,32 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
+from multiprocessing import Pool
+import os
 import time
+import warnings
+from collections import deque 
 
-# === OPTİMİZE EDİLMİŞ ES HİPERPARAMETRELERİ ===
-MU = 50                     # Ebeveyn sayısı (stabil popülasyon)
-LAMBDA = 350                # Offspring (mu*7 oranı korunuyor)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# === OPTIMIZED HYPERPARAMETERS ===
+NUM_PROCESSES = max(1, os.cpu_count() - 1)
+MU = 50                     
+LAMBDA = 450                
 MAX_GENERATIONS = 200
 
-INPUT_SIZE = 17
-HIDDEN_SIZE = 32            
+# === ARCHITECTURE ===
+INPUT_SIZE = 19             # Flood Fill + Tail + Length
+HIDDEN_SIZE = 128           
 OUTPUT_SIZE = 3
 
-# Mutasyon parametreleri - optimize edilmiş
-INITIAL_SIGMA = 0.25        # Çok daha stabil başlangıç
-MIN_SIGMA = 0.05            # Çok düşük olmamalı ama arama kaybolmasın
-MAX_SIGMA = 0.8             # Aşırı kaos engellenir
-TAU = 0.03                  # Self-adaptive sigma rate (optimal aralık)
+# Mutation parameters
+INITIAL_SIGMA = 0.5         
+MIN_SIGMA = 0.05            
+MAX_SIGMA = 1.0             
+TAU = 0.05                  
 
 class ESNeuralNetwork:
     def __init__(self, input_size, hidden_size, output_size):
@@ -24,13 +34,11 @@ class ESNeuralNetwork:
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-        # Başlangıç ağırlıkları
         self.weights1 = np.random.uniform(-1, 1, (input_size, hidden_size))
         self.bias1 = np.random.uniform(-1, 1, (1, hidden_size))
         self.weights2 = np.random.uniform(-1, 1, (hidden_size, output_size))
         self.bias2 = np.random.uniform(-1, 1, (1, output_size))
         
-        # Self-adaptive mutation sigma
         self.sigma = INITIAL_SIGMA
 
     def relu(self, x):
@@ -39,24 +47,20 @@ class ESNeuralNetwork:
     def predict(self, input_data):
         if len(input_data.shape) == 1:
             input_data = input_data.reshape(1, -1)
-
         hidden = self.relu(np.dot(input_data, self.weights1) + self.bias1)
         output = np.dot(hidden, self.weights2) + self.bias2
-        
         action = [0, 0, 0]
         action[np.argmax(output)] = 1
         return action
 
     def es_mutate(self):
-        # === Self-adaptive sigma update ===
+        # Self-adaptive sigma
         self.sigma *= np.exp(TAU * np.random.randn())
         self.sigma = max(MIN_SIGMA, min(self.sigma, MAX_SIGMA))
 
-        # Mutasyon fonksiyonu
         def mutate(mat):
             return mat + np.random.randn(*mat.shape) * self.sigma
 
-        # Apply mutation
         self.weights1 = mutate(self.weights1)
         self.bias1 = mutate(self.bias1)
         self.weights2 = mutate(self.weights2)
@@ -71,15 +75,11 @@ class ESNeuralNetwork:
         nn.sigma = self.sigma
         return nn
 
-
-# === GELİŞMİŞ STATE SİSTEMİ (16 input) ===
+# === STATE FUNCTION (19 Inputs) ===
 def get_state(game):
     head = game.snake[0]
-    total_grid_size = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
-    normalized_length = len(game.snake) / total_grid_size
+    tail = game.snake[-1]
     
-    state.append(normalized_length)
-
     point_l = Point(head.x - BLOCK_SIZE, head.y)
     point_r = Point(head.x + BLOCK_SIZE, head.y)
     point_u = Point(head.x, head.y - BLOCK_SIZE)
@@ -90,219 +90,228 @@ def get_state(game):
     dir_u = game.direction == Direction.UP
     dir_d = game.direction == Direction.DOWN
 
-    state = []
-
-    # === 1. Anlık Tehlike ===
-    danger_straight = 0
-    danger_right = 0
-    danger_left = 0
-
-    if dir_r:
-        danger_straight = game.is_collision(point_r)
-        danger_right = game.is_collision(point_d)
-        danger_left = game.is_collision(point_u)
-    elif dir_l:
-        danger_straight = game.is_collision(point_l)
-        danger_right = game.is_collision(point_u)
-        danger_left = game.is_collision(point_d)
-    elif dir_u:
-        danger_straight = game.is_collision(point_u)
-        danger_right = game.is_collision(point_r)
-        danger_left = game.is_collision(point_l)
-    elif dir_d:
-        danger_straight = game.is_collision(point_d)
-        danger_right = game.is_collision(point_l)
-        danger_left = game.is_collision(point_r)
-
-    state.extend([int(danger_straight), int(danger_right), int(danger_left)])
-
-    # === 2. Raycasting (3 input) ===
-    if dir_r: directions = [Point(BLOCK_SIZE, 0), Point(0, BLOCK_SIZE), Point(0, -BLOCK_SIZE)]
-    elif dir_l: directions = [Point(-BLOCK_SIZE, 0), Point(0, -BLOCK_SIZE), Point(0, BLOCK_SIZE)]
-    elif dir_u: directions = [Point(0, -BLOCK_SIZE), Point(BLOCK_SIZE, 0), Point(-BLOCK_SIZE, 0)]
-    elif dir_d: directions = [Point(0, BLOCK_SIZE), Point(-BLOCK_SIZE, 0), Point(BLOCK_SIZE, 0)]
+    occupied = set((p.x, p.y) for p in game.snake)
     
-    for direction in directions:
-        dist = 0
-        p = Point(head.x, head.y)
-        for _ in range(20):
-            p = Point(p.x + direction.x, p.y + direction.y)
-            dist += 1
-            if game.is_collision(p): break
-        state.append(1.0 / dist)
+    # Flood Fill
+    def get_accessible_area(start_point):
+        if (start_point.x < 0 or start_point.x >= game.w or 
+            start_point.y < 0 or start_point.y >= game.h or 
+            (start_point.x, start_point.y) in occupied):
+            return 0.0
+        
+        visited = set()
+        queue = deque([(start_point.x, start_point.y)])
+        visited.add((start_point.x, start_point.y))
+        count = 0
+        MAX_SEARCH = 80
+        while queue and count < MAX_SEARCH:
+            cx, cy = queue.popleft()
+            count += 1
+            for nx, ny in [(cx-BLOCK_SIZE, cy), (cx+BLOCK_SIZE, cy), 
+                           (cx, cy-BLOCK_SIZE), (cx, cy+BLOCK_SIZE)]:
+                if (0 <= nx < game.w and 0 <= ny < game.h and 
+                    (nx, ny) not in occupied and (nx, ny) not in visited):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        return count / MAX_SEARCH
 
-    # === 3. Yön Bilgisi ===
-    state.extend([int(dir_l), int(dir_r), int(dir_u), int(dir_d)])
+    if dir_r: p_s, p_r, p_l = point_r, point_d, point_u
+    elif dir_l: p_s, p_r, p_l = point_l, point_u, point_d
+    elif dir_u: p_s, p_r, p_l = point_u, point_r, point_l
+    else: p_s, p_r, p_l = point_d, point_l, point_r
 
-    # === 4. Yemek Yönü ===
-    food = game.food
-    state.extend([
-        int(food.x < head.x),
-        int(food.x > head.x),
-        int(food.y < head.y),
-        int(food.y > head.y),
-    ])
+    total_grid_size = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
+    norm_length = len(game.snake) / total_grid_size
 
-    # === 5. Space Awareness ===
-    def measure_space(start, direction):
-        space = 0
-        p = start
-        for _ in range(5):
-            p = Point(p.x + direction.x, p.y + direction.y)
-            if game.is_collision(p): break
-            space += 1
-        return space / 5.0
-
-    if dir_r: vec_left, vec_right = Point(0, -BLOCK_SIZE), Point(0, BLOCK_SIZE)
-    elif dir_l: vec_left, vec_right = Point(0, BLOCK_SIZE), Point(0, -BLOCK_SIZE)
-    elif dir_u: vec_left, vec_right = Point(-BLOCK_SIZE, 0), Point(BLOCK_SIZE, 0)
-    else:      vec_left, vec_right = Point(BLOCK_SIZE, 0), Point(-BLOCK_SIZE, 0)
-
-    state.append(measure_space(head, vec_left))
-    state.append(measure_space(head, vec_right))
-
+    state = [
+        # Danger (3)
+        (dir_r and game.is_collision(point_r)) or (dir_l and game.is_collision(point_l)) or (dir_u and game.is_collision(point_u)) or (dir_d and game.is_collision(point_d)),
+        (dir_u and game.is_collision(point_r)) or (dir_d and game.is_collision(point_l)) or (dir_l and game.is_collision(point_u)) or (dir_r and game.is_collision(point_d)),
+        (dir_d and game.is_collision(point_r)) or (dir_u and game.is_collision(point_l)) or (dir_r and game.is_collision(point_u)) or (dir_l and game.is_collision(point_d)),
+        # Direction (4)
+        dir_l, dir_r, dir_u, dir_d,
+        # Food (4)
+        game.food.x < head.x, game.food.x > head.x,
+        game.food.y < head.y, game.food.y > head.y,
+        # Flood Fill (3)
+        get_accessible_area(p_s), get_accessible_area(p_r), get_accessible_area(p_l),
+        # Body Size (1)
+        norm_length,
+        # Tail (4)
+        tail.x < head.x, tail.x > head.x, tail.y < head.y, tail.y > head.y
+    ]
     return np.array(state, dtype=float)
 
 
-# === AGENT EVALUATION ===
+# === FIXED FITNESS FUNCTION ===
 def evaluate_agent(nn, render=False, display_speed_multiplier=1):
     game = SnakeGameAI(w=640, h=480, render_mode=render, display_speed_multiplier=display_speed_multiplier)
     game.reset()
 
     steps = 0
-    max_steps = 100
+    max_steps = 150 
 
     while True:
         state = get_state(game)
         action = nn.predict(state)
-
-        head = game.snake[0]
-        food = game.food
-        before = abs(head.x - food.x) + abs(head.y - food.y)
-
         reward, game_over, score = game.play_step(action)
-
-        head = game.snake[0]
-        food = game.food
-        after = abs(head.x - food.x) + abs(head.y - food.y)
 
         steps += 1
         if score > 0:
-            max_steps = 100 + score * 50
-
-        if steps > max_steps:
-            game_over = True
-
-        if game_over:
+            max_steps = 150 + (score * 100) 
+        
+        if game_over or steps > max_steps:
             break
 
-    fitness = score * 1000 + steps * 0.1
-    if score == 0:
-        fitness += max(0, 500 - after)
-
+    # Reverted to Cubic fitness (Matches your successful GA)
+    # 2**score is too unstable for ES
+    fitness = (score ** 3) * 100 + steps + (score * 500)
+    
     return max(0.1, fitness), score
 
+def evaluate_agent_wrapper(nn):
+    return evaluate_agent(nn, render=False)
 
-# === TRAINING LOOP (Optimize edilmiş) ===
+
+# === TRAINING LOOP (MU + LAMBDA) ===
 def main():
-    print("\n=== STARTING OPTIMIZED EVOLUTIONARY STRATEGIES ===")
+    print("\n=== STARTING ES (MU + LAMBDA) STRATEGY ===")
+    print("Survival of the fittest (Parents compete with children)")
+    print(f"Processes: {NUM_PROCESSES}")
+    print(f"Generations: {MAX_GENERATIONS}")
+    print("-" * 60)
 
-    parents = [ESNeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(MU)]
+    # 1. Initialize Parents
+    parents_list = [ESNeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(MU)]
+    
+    # We must evaluate initial parents to get their fitness
+    with Pool(processes=NUM_PROCESSES) as pool:
+        results = pool.map(evaluate_agent_wrapper, parents_list)
+    
+    # Store population as dictionaries to avoid re-evaluating parents
+    population_data = []
+    for i, agent in enumerate(parents_list):
+        population_data.append({
+            'agent': agent,
+            'fitness': results[i][0],
+            'score': results[i][1]
+        })
 
     best_scores = []
     avg_scores = []
     gen_idx = []
-
-    all_time_best = None
+    
     all_time_best_score = -1
-
     stagnation = 0
-    last_best = 0
 
     for gen in range(MAX_GENERATIONS):
-
-        offspring = []
+        
+        # 2. Create Offspring (Mutate copies of current population)
+        offspring_agents = []
         for _ in range(LAMBDA):
-            p = np.random.choice(parents)
-            c = p.copy()
-            c.es_mutate()
-            offspring.append(c)
+            # Pick a parent at random from the survivors
+            parent_data = np.random.choice(population_data)
+            parent_agent = parent_data['agent']
+            
+            child = parent_agent.copy()
+            child.es_mutate()
+            offspring_agents.append(child)
 
-        fitnesses = []
-        scores = []
+        # 3. Evaluate ONLY Offspring
+        with Pool(processes=NUM_PROCESSES) as pool:
+            results = pool.map(evaluate_agent_wrapper, offspring_agents)
+        
+        offspring_data = []
+        for i, agent in enumerate(offspring_agents):
+            offspring_data.append({
+                'agent': agent,
+                'fitness': results[i][0],
+                'score': results[i][1]
+            })
 
-        for agent in offspring:
-            fit, score = evaluate_agent(agent)
-            fitnesses.append(fit)
-            scores.append(score)
+        # 4. (MU + LAMBDA) SELECTION
+        # Combine old parents and new children
+        combined_population = population_data + offspring_data
+        
+        # Sort by fitness (High to Low)
+        combined_population.sort(key=lambda x: x['fitness'], reverse=True)
+        
+        # Survivor Selection: Top MU agents survive
+        population_data = combined_population[:MU]
+        
+        # 5. Stats
+        current_best = population_data[0]
+        current_best_score = current_best['score']
+        avg_score = sum(p['score'] for p in population_data) / MU
 
-        idx = np.argsort(fitnesses)[::-1]
-        parents = [offspring[i] for i in idx[:MU]]
-
-        best_score = max(scores)
-        avg_score = np.mean(scores)
-
-        if best_score > all_time_best_score:
-            all_time_best_score = best_score
-            all_time_best = offspring[np.argmax(scores)].copy()
+        if current_best_score > all_time_best_score:
+            all_time_best_score = current_best_score
             stagnation = 0
-            print(f"\n>> NEW RECORD SCORE: {all_time_best_score}\n")
-
-        if best_score <= last_best:
-            stagnation += 1
+            print(f"\n>>> NEW RECORD: {all_time_best_score} <<<")
         else:
-            stagnation = 0
+            stagnation += 1
 
-        last_best = best_score
-
-        if stagnation > 15:
-            print("!! STAGNATION DETECTED → Smooth Sigma Boost")
-            for p in parents:
-                p.sigma *= 1.2
-                p.sigma = min(p.sigma, 0.6)
-            stagnation = 0
-
-        best_scores.append(best_score)
+       # === REPLACEMENT START ===
+        # OLD: Just boosted sigma
+        # NEW: MASS EXTINCTION EVENT
+        if stagnation > 15:  # Trigger faster (15 gens instead of 20)
+            print(f"\n!!! STAGNATION DETECTED (Best stuck at {all_time_best_score}) !!!")
+            print(">>> INITIATING MASS EXTINCTION EVENT <<<")
+            
+            # 1. ELITISM: Keep only the Top 5 Agents (The "Kings")
+            # We already sorted population_data by fitness, so just slice the top 5
+            survivors = population_data[:5]
+            
+            # 2. EXTINCTION: Create completely NEW random agents to fill the rest
+            num_new_agents = MU - 5
+            print(f">>> Keeping 5 Elites, Injecting {num_new_agents} Fresh Random Agents...")
+            
+            new_blood = [ESNeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(num_new_agents)]
+            
+            # 3. Evaluate the new agents immediately
+            with Pool(processes=NUM_PROCESSES) as pool:
+                results = pool.map(evaluate_agent_wrapper, new_blood)
+            
+            # 4. Add them to the population list
+            for i, agent in enumerate(new_blood):
+                # Give new agents a high sigma so they explore aggressively
+                agent.sigma = 0.8 
+                survivors.append({
+                    'agent': agent,
+                    'fitness': results[i][0],
+                    'score': results[i][1]
+                })
+            
+            # 5. Overwrite the population with our new mixed group
+            population_data = survivors
+            stagnation = 0 # Reset counter
+        # === REPLACEMENT END ===
+        
+        best_scores.append(current_best_score)
         avg_scores.append(avg_score)
         gen_idx.append(gen + 1)
 
-        print(f"Gen {gen+1:3d} | Best: {best_score:3d} | Avg: {avg_score:6.2f} | Sigma: {parents[0].sigma:.3f}")
+        print(f"Gen {gen+1:3d} | Best: {current_best_score:3d} | Avg: {avg_score:6.2f} | Sigma: {population_data[0]['agent'].sigma:.3f}")
 
-        if gen % 10 == 0:
-            plt.figure(figsize=(10, 5))
-            plt.plot(gen_idx, best_scores, label="Best")
-            plt.plot(gen_idx, avg_scores, label="Avg", linestyle="--")
-            plt.title("Optimized ES Training Progress")
-            plt.xlabel("Generation")
-            plt.ylabel("Score")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.savefig("training_progress.png")
-            plt.close()
+    # Plot
+    plt.figure(figsize=(10, 5))
+    plt.plot(gen_idx, best_scores, label="Best")
+    plt.plot(gen_idx, avg_scores, label="Avg", linestyle="--")
+    plt.title("ES (Mu + Lambda) Training Progress")
+    plt.xlabel("Generation")
+    plt.ylabel("Score")
+    plt.legend()
+    plt.savefig("es_training_plus.png")
+    plt.close()
 
     print("\n=== TRAINING COMPLETE ===")
     print(f"All-time best score: {all_time_best_score}")
 
     while True:
-        print("\n1. Watch All-Time Best")
-        print("2. Watch Best 5 of Final Gen")
-        print("n. Exit")
-
-        cmd = input("Choose: ").strip().lower()
-        if cmd == "n":
-            break
-        elif cmd == "1":
-            fit, score = evaluate_agent(all_time_best, render=True, display_speed_multiplier=3)
-            print(f"Final Score: {score}")
-        elif cmd == "2":
-            print("\nShowing top 5 agents from final generation...")
-            num_to_show = min(5, len(parents))
-            for i in range(num_to_show):
-                print(f"\n--- Agent {i+1} (Rank {i+1}) ---")
-                fit, score = evaluate_agent(parents[i], render=True, display_speed_multiplier=3)
-                print(f"Final Score: {score}")
-
+        cmd = input("\nWatch (b)est agent or (q)uit? ").lower()
+        if cmd == 'q': break
+        if cmd == 'b':
+            evaluate_agent(population_data[0]['agent'], render=True, display_speed_multiplier=5)
 
 if __name__ == "__main__":
     main()
-
