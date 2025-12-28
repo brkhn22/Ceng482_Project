@@ -1,42 +1,51 @@
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # Non-GUI backend for saving files
 import matplotlib.pyplot as plt
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
 from multiprocessing import Pool
 import os
 import warnings
 from collections import deque 
+import sys
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-# --- GENETIC ALGORITHM PARAMETERS ---
+# ==========================================
+# CONFIGURATION
+# ==========================================
 NUM_PROCESSES = max(1, os.cpu_count() - 1)
-POPULATION_SIZE = 400         
-MUTATION_RATE = 0.07          # Lowered slightly to preserve "smart" behaviors
-MUTATION_STRENGTH = 0.2       
-MAX_GENERATIONS = 200          
 
-# === ARCHITECTURE CHANGES ===
-INPUT_SIZE = 19               # CHANGED: 14 -> 19 (Flood Fill + Body Size + Tail)
-HIDDEN_SIZE = 128             # Keep 128 for brain capacity
-OUTPUT_SIZE = 3
+# Run Parameters
+ITERATIONS = 2             # Number of separate training sessions
+POPULATION_SIZE = 500          
+MAX_GENERATIONS = 500       # Generations per iteration
+ELITISM_SELECTION_PERCENT = 0.024
+
+# Evolution Strategy Hyperparameters
+MUTATION_RATE = 0.05        
+MUTATION_STRENGTH = 0.2  
+CROSSOVER_RATE = 0.4        
+
+# Architecture
+INPUT_SIZE = 24             
+HIDDEN_SIZE = 16
+OUTPUT_SIZE = 3        
 
 # ----------------------------------------------------------
-# NEURAL NETWORK
+# 1. NEURAL NETWORK
 # ----------------------------------------------------------
-
 class NeuralNetwork:
     def __init__(self, input_size, hidden_size, output_size):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-        self.weights1 = np.random.uniform(-1, 1, (input_size, hidden_size))
-        self.bias1 = np.random.uniform(-1, 1, (1, hidden_size))
-        
-        self.weights2 = np.random.uniform(-1, 1, (hidden_size, output_size))
-        self.bias2 = np.random.uniform(-1, 1, (1, output_size))
+        # He Initialization
+        self.weights1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0/input_size)
+        self.bias1 = np.random.randn(1, hidden_size) * 0.1  
+        self.weights2 = np.random.randn(hidden_size, output_size) * np.sqrt(2.0/hidden_size)
+        self.bias2 = np.random.randn(1, output_size) * 0.1
 
     def relu(self, x):
         return np.maximum(0, x)
@@ -49,268 +58,337 @@ class NeuralNetwork:
         action[np.argmax(output)] = 1
         return action
     
-    def mutate(self, mutation_rate=MUTATION_RATE, mutation_strength=MUTATION_STRENGTH):
+    def mutate(self):
         def mutate_matrix(matrix):
-            mask = np.random.random(matrix.shape) < mutation_rate
-            matrix[mask] += np.random.randn(*matrix.shape)[mask] * mutation_strength
-
+            mask = np.random.random(matrix.shape) < MUTATION_RATE
+            noise = np.random.randn(*matrix.shape) * MUTATION_STRENGTH
+            matrix[mask] += noise[mask]
+            np.clip(matrix, -5.0, 5.0, out=matrix)
+        
         mutate_matrix(self.weights1)
         mutate_matrix(self.bias1)
         mutate_matrix(self.weights2)
         mutate_matrix(self.bias2)
-    
-    def copy(self):
-        nn = NeuralNetwork(self.input_size, self.hidden_size, self.output_size)
-        nn.weights1 = np.copy(self.weights1)
-        nn.bias1 = np.copy(self.bias1)
-        nn.weights2 = np.copy(self.weights2)
-        nn.bias2 = np.copy(self.bias2)
-        return nn
 
     @staticmethod
     def crossover(p1, p2):
         child = NeuralNetwork(p1.input_size, p1.hidden_size, p1.output_size)
         
-        def mix(a, b):
-            mask = np.random.rand(*a.shape) < 0.5
-            return np.where(mask, a, b)
+        def select_genes(w1, w2):
+            mask = np.random.rand(*w1.shape) < 0.5
+            return np.where(mask, w1, w2)
         
-        child.weights1 = mix(p1.weights1, p2.weights1)
-        child.bias1 = mix(p1.bias1, p2.bias1)
-        child.weights2 = mix(p1.weights2, p2.weights2)
-        child.bias2 = mix(p1.bias2, p2.bias2)
+        child.weights1 = select_genes(p1.weights1, p2.weights1)
+        child.bias1 = select_genes(p1.bias1, p2.bias1)
+        child.weights2 = select_genes(p1.weights2, p2.weights2)
+        child.bias2 = select_genes(p1.bias2, p2.bias2)
+        
         return child
+        
+    def copy(self):
+        nn = NeuralNetwork(self.input_size, self.hidden_size, self.output_size)
+        nn.weights1 = self.weights1.copy()
+        nn.bias1 = self.bias1.copy()
+        nn.weights2 = self.weights2.copy()
+        nn.bias2 = self.bias2.copy()
+        return nn
+
 
 # ----------------------------------------------------------
-# STATE FUNCTION (19 INPUTS: Flood + Size + Tail)
+# HELPER: FLOOD FILL
 # ----------------------------------------------------------
+def calculate_flood_fill(game):
+    if len(game.snake) < 10: return 1.0
+    head = game.snake[0]
+    board_area = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
+    obstacles = set((p.x, p.y) for p in game.snake)
+    queue = deque([(head.x, head.y)])
+    visited = set([(head.x, head.y)])
+    count = 0
+    limit = board_area * 0.5 
+    moves = [(0, -BLOCK_SIZE), (0, BLOCK_SIZE), (-BLOCK_SIZE, 0), (BLOCK_SIZE, 0)]
+    while queue:
+        cx, cy = queue.popleft()
+        count += 1
+        if count > limit: return 1.0
+        for dx, dy in moves:
+            nx, ny = cx + dx, cy + dy
+            if nx < 0 or nx >= game.w or ny < 0 or ny >= game.h: continue
+            if (nx, ny) in obstacles: continue
+            if (nx, ny) not in visited:
+                visited.add((nx, ny))
+                queue.append((nx, ny))
+    return count / board_area
 
+# ----------------------------------------------------------
+# STATE FUNCTION
+# ----------------------------------------------------------
 def get_state(game):
     head = game.snake[0]
-    tail = game.snake[-1]
+    body_set = set((p.x, p.y) for p in game.snake[1:])
+    standard_angles = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]
+    if game.direction == Direction.UP: shift = 0
+    elif game.direction == Direction.RIGHT: shift = 2
+    elif game.direction == Direction.DOWN: shift = 4
+    else: shift = 6 
+    current_rays = standard_angles[shift:] + standard_angles[:shift]
+    state = []
     
-    point_l = Point(head.x - BLOCK_SIZE, head.y)
-    point_r = Point(head.x + BLOCK_SIZE, head.y)
-    point_u = Point(head.x, head.y - BLOCK_SIZE)
-    point_d = Point(head.x, head.y + BLOCK_SIZE)
-
-    dir_l = game.direction == Direction.LEFT
-    dir_r = game.direction == Direction.RIGHT
-    dir_u = game.direction == Direction.UP
-    dir_d = game.direction == Direction.DOWN
-
-    occupied = set((p.x, p.y) for p in game.snake)
-
-    # --- 1. Flood Fill Logic ---
-    def get_accessible_area(start_point):
-        if (start_point.x < 0 or start_point.x >= game.w or 
-            start_point.y < 0 or start_point.y >= game.h or 
-            (start_point.x, start_point.y) in occupied):
-            return 0.0
-
-        visited = set()
-        queue = deque([(start_point.x, start_point.y)])
-        visited.add((start_point.x, start_point.y))
-        count = 0
-        MAX_SEARCH = 80 
+    for dx, dy in current_rays:
+        cx, cy = head.x, head.y
+        dist = 0
+        found_food = 0
+        found_body = 0
+        step_x = dx * BLOCK_SIZE
+        step_y = dy * BLOCK_SIZE
         
-        while queue and count < MAX_SEARCH:
-            cx, cy = queue.popleft()
-            count += 1
-            neighbors = [
-                (cx - BLOCK_SIZE, cy), (cx + BLOCK_SIZE, cy),
-                (cx, cy - BLOCK_SIZE), (cx, cy + BLOCK_SIZE)
-            ]
-            for nx, ny in neighbors:
-                if (0 <= nx < game.w and 0 <= ny < game.h and 
-                    (nx, ny) not in occupied and (nx, ny) not in visited):
-                    visited.add((nx, ny))
-                    queue.append((nx, ny))
-        return count / MAX_SEARCH
+        while True:
+            cx += step_x
+            cy += step_y
+            dist += 1
+            if cx < 0 or cx >= game.w or cy < 0 or cy >= game.h: break 
+            if (cx, cy) in body_set:
+                found_body = 1
+                break 
+            if cx == game.food.x and cy == game.food.y: found_food = 1
 
-    # Relative Directions
-    if dir_r:
-        p_straight, p_right, p_left = point_r, point_d, point_u
-    elif dir_l:
-        p_straight, p_right, p_left = point_l, point_u, point_d
-    elif dir_u:
-        p_straight, p_right, p_left = point_u, point_r, point_l
-    else: # dir_d
-        p_straight, p_right, p_left = point_d, point_l, point_r
-        
-    # --- New Inputs Calculations ---
-    total_grid_size = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
-    norm_length = len(game.snake) / total_grid_size
-
-    # --- 2. Construct State Vector ---
-    state = [
-        # Danger (3)
-        (dir_r and game.is_collision(point_r)) or (dir_l and game.is_collision(point_l)) or (dir_u and game.is_collision(point_u)) or (dir_d and game.is_collision(point_d)),
-        (dir_u and game.is_collision(point_r)) or (dir_d and game.is_collision(point_l)) or (dir_l and game.is_collision(point_u)) or (dir_r and game.is_collision(point_d)),
-        (dir_d and game.is_collision(point_r)) or (dir_u and game.is_collision(point_l)) or (dir_r and game.is_collision(point_u)) or (dir_l and game.is_collision(point_d)),
-
-        # Direction (4)
-        dir_l, dir_r, dir_u, dir_d,
-
-        # Food (4)
-        game.food.x < head.x, game.food.x > head.x,
-        game.food.y < head.y, game.food.y > head.y,
-        
-        # Flood Fill (3)
-        get_accessible_area(p_straight),
-        get_accessible_area(p_right),
-        get_accessible_area(p_left),
-        
-        # NEW: Body Size (1)
-        norm_length,
-
-        # NEW: Tail Direction (4)
-        tail.x < head.x, # Tail Left
-        tail.x > head.x, # Tail Right
-        tail.y < head.y, # Tail Up
-        tail.y > head.y  # Tail Down
-    ]
+        norm_dist = 1.0 / dist 
+        state.extend([norm_dist, found_food, found_body])
 
     return np.array(state, dtype=float)
 
 # ----------------------------------------------------------
-# FITNESS
+# FITNESS FUNCTION
 # ----------------------------------------------------------
-
-def evaluate_agent(nn, render=False, display_speed_multiplier=1):
-    game = SnakeGameAI(w=640, h=480, render_mode=render, display_speed_multiplier=display_speed_multiplier)
+def evaluate_agent(nn):
+    game = SnakeGameAI(w=640, h=480, render_mode=False) 
     game.reset()
-
-    steps = 0
-    max_steps = 150 # Increased
-
+    steps_total = 0
+    steps_since_eaten = 0
+    starvation_limit = 100 * len(game.snake) 
+    
     while True:
         state = get_state(game)
         action = nn.predict(state)
         reward, game_over, score = game.play_step(action)
-        steps += 1
+        steps_total += 1
+        steps_since_eaten += 1
         
-        if score > 0:
-            max_steps = 150 + (score * 100)
+        if steps_since_eaten > starvation_limit:
+            game_over = True
+            reward = -10 
+        if reward > 0:
+            steps_since_eaten = 0
+            starvation_limit = 200 # FIXED: Corrected starvation logic
+        if game_over: break
 
-        if game_over or steps > max_steps:
-            break
+        fitness_bonus = 0
+      #  if score>50:
+      #      flood_fill_val = calculate_flood_fill(game)
+      #      fitness_bonus = (score ** 3) * (flood_fill_val * 0.1)
 
-    # CHANGED: Replaced 2**score with score**3 to prevent explosion
-    fitness = (score ** 3) * 100 + steps + (score * 500)
-    return max(0.1, fitness), score
+    return (score ** 3) + (steps_total * 0.001), score #+ fitness_bonus, score
 
-def evaluate_agent_wrapper(nn):
-    return evaluate_agent(nn, render=False)
+def eval_wrapper(nn): return evaluate_agent(nn)
 
 # ----------------------------------------------------------
-# GA OPERATIONS
+# PLOTTING FUNCTIONS
 # ----------------------------------------------------------
-
-def select_best(population, fitnesses):
-    order = np.argsort(fitnesses)[::-1]
-    return [population[i] for i in order]
-
-def next_generation(best_agents, population_size, all_time_best):
-    new = []
-
-    # --- 1. Absolute Elitism ---
-    # Ensure the All-Time Best is always preserved (2 copies)
-    if all_time_best:
-        new.append(all_time_best.copy())
-        new.append(all_time_best.copy())
-
-    # --- 2. Current Generation Elitism ---
-    # Keep top 3 from current generation
-    for i in range(3):
-        if len(new) < population_size:
-            new.append(best_agents[i].copy())
-
-    # --- 3. Crossover & Mutation ---
-    # Parents come from the top 20%
-    parent_pool_size = max(2, int(population_size * 0.2))
-    parent_pool = best_agents[:parent_pool_size]
+def plot_iteration_results(iteration_id, gen_history, best_history, avg_history):
+    """Generates a line graph for a single iteration."""
+    plt.figure(figsize=(10, 6))
+    plt.plot(gen_history, best_history, label='Best Score', color='#1f77b4', linewidth=2)
+    plt.plot(gen_history, avg_history, label='Avg Score', color='#ff7f0e', linestyle='--', alpha=0.7)
     
-    # Add all-time best to the breeding pool as well
-    if all_time_best:
-        parent_pool.append(all_time_best)
+    plt.title(f'Iteration {iteration_id}: Training Progress')
+    plt.xlabel('Generations')
+    plt.ylabel('Score')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+    
+    filename = f"iteration_{iteration_id}.png"
+    plt.savefig(filename)
+    plt.close()
+    print(f"   [Graph Saved]: {filename}")
 
-    while len(new) < population_size:
-        p1 = np.random.choice(parent_pool)
-        p2 = np.random.choice(parent_pool)
-        
-        child = NeuralNetwork.crossover(p1, p2)
-        child.mutate()
-        new.append(child)
-
-    return new
+def plot_final_summary(champions):
+    """Generates a bar chart comparing best scores across all iterations."""
+    ids = [c['id'] for c in champions]
+    scores = [c['score'] for c in champions]
+    
+    plt.figure(figsize=(12, 6))
+    bars = plt.bar(ids, scores, color='#2ca02c', alpha=0.8, edgecolor='black')
+    
+    plt.title('Final Champion Scores per Iteration')
+    plt.xlabel('Iteration ID')
+    plt.ylabel('Best Score Achieved')
+    plt.xticks(ids) # Ensure only integer IDs are shown
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    
+    # Add score labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 1,
+                f'{int(height)}',
+                ha='center', va='bottom')
+    
+    plt.savefig("final_summary_scores.png")
+    plt.close()
+    print(f"   [Summary Graph Saved]: final_summary_scores.png")
 
 # ----------------------------------------------------------
-# MAIN LOOP
+# TRAINING LOOP FOR ONE ITERATION
 # ----------------------------------------------------------
-
-def main():
-    print(f"Starting Genetic Algorithm with {NUM_PROCESSES} parallel processes...")
-    print(f"Population: {POPULATION_SIZE}, Generations: {MAX_GENERATIONS}")
-    print(f"Structure: {INPUT_SIZE} -> {HIDDEN_SIZE} -> {OUTPUT_SIZE}")
-    print("-" * 60)
+def train_iteration(iteration_id):
+    print(f"\n" + "="*50)
+    print(f"STARTING ITERATION {iteration_id} / {ITERATIONS}")
+    print("="*50)
     
     population = [NeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(POPULATION_SIZE)]
     
-    best_scores = []
-    avg_scores = []
-    gens = []
-    
-    all_time_best = None
     all_time_best_score = -1
-
+    all_time_best_agent = None
+    
+    # Data Collection for Graphing
+    gen_history = []
+    best_history = []
+    avg_history = []
+    
     for gen in range(1, MAX_GENERATIONS + 1):
-        with Pool(processes=NUM_PROCESSES) as pool:
-            results = pool.map(evaluate_agent_wrapper, population)
+        with Pool(NUM_PROCESSES) as pool:
+            results = pool.map(eval_wrapper, population)
         
-        fitnesses = np.array([r[0] for r in results])
         scores = np.array([r[1] for r in results])
-
-        current_best_score = np.max(scores)
-        avg_score = np.mean(scores)
+        fitnesses = np.array([r[0] for r in results])
         
-        best_agent_idx = np.argmax(scores)
-        current_best_agent = population[best_agent_idx]
+        best_gen_score = np.max(scores)
+        avg_gen_score = np.mean(scores)
+        
+        # Save Stats
+        gen_history.append(gen)
+        best_history.append(best_gen_score)
+        avg_history.append(avg_gen_score)
+        
+        if best_gen_score > all_time_best_score:
+            all_time_best_score = best_gen_score
+            best_idx = np.argmax(scores)
+            all_time_best_agent = population[best_idx].copy()
+            print(f"Iter {iteration_id} | Gen {gen:3d} | >>> NEW RECORD: {all_time_best_score}")
+        
+        if gen % 10 == 0:
+            print(f"Iter {iteration_id} | Gen {gen:3d} | Best: {best_gen_score:3d} | Avg: {avg_gen_score:.2f}")
 
-        # Update All-Time Best
-        if current_best_score > all_time_best_score:
-            all_time_best_score = current_best_score
-            all_time_best = current_best_agent.copy()
-            print(f"\n>>> NEW RECORD: {all_time_best_score} <<<")
+        # BREEDING
+        new_pop = []
+        indices = np.argsort(fitnesses)[::-1]
 
-        best_scores.append(current_best_score)
-        avg_scores.append(avg_score)
-        gens.append(gen)
+        # ELITISM
+        num_random_max = int(POPULATION_SIZE * ELITISM_SELECTION_PERCENT)
+        for i in range(num_random_max):
+            parent_max = population[indices[i]].copy()
+            new_pop.append(parent_max)
+            child_max = parent_max.copy()
+            child_max.mutate()
+            new_pop.append(child_max)
+            
+        all_indices = np.arange(POPULATION_SIZE)
+        while len(new_pop) < POPULATION_SIZE:
+            t1_indices = np.random.choice(all_indices, size=4, replace=False)
+            t1_winner_idx = t1_indices[np.argmax(fitnesses[t1_indices])]
+            p1 = population[t1_winner_idx]
+            
+            if np.random.rand() < CROSSOVER_RATE:
+                t2_indices = np.random.choice(all_indices, size=4, replace=False)
+                t2_winner_idx = t2_indices[np.argmax(fitnesses[t2_indices])]
+                p2 = population[t2_winner_idx]
+                child = NeuralNetwork.crossover(p1, p2)
+            else:
+                child = p1.copy()
+            
+            child.mutate()
+            new_pop.append(child)
+            
+        population = new_pop
 
-        print(f"Gen {gen:3d} | Best: {current_best_score:3d} (Record: {all_time_best_score}) | Avg: {avg_score:.2f}")
+    print(f"-> Iteration {iteration_id} Finished. Best Score: {all_time_best_score}")
+    
+    # 
+    # Generate graph for this iteration
+    plot_iteration_results(iteration_id, gen_history, best_history, avg_history)
+    
+    return all_time_best_agent, all_time_best_score
 
-        # Evolution step
-        sorted_pop = select_best(population, fitnesses)
-        if gen < MAX_GENERATIONS:
-            population = next_generation(sorted_pop, POPULATION_SIZE, all_time_best)
-
-    # Plot
-    plt.figure(figsize=(10,6))
-    plt.plot(gens, best_scores, label="Best (Current Gen)")
-    plt.plot(gens, avg_scores, label="Average")
-    plt.title("Genetic Algorithm Training (Flood+Tail)")
-    plt.xlabel("Generation")
-    plt.ylabel("Score")
-    plt.legend()
-    plt.savefig("ga_training_v3.png")
-
-    print(f"\nTraining Complete! All-time Best: {all_time_best_score}")
-
-    while True:
-        cmd = input("\nWatch (b)est all time, or (q)uit? ").lower()
-        if cmd == 'q': break
-        if cmd == 'b' and all_time_best:
-            evaluate_agent(all_time_best, render=True, display_speed_multiplier=5)
-
+# ----------------------------------------------------------
+# MAIN EXECUTION
+# ----------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    
+    champions = [] # Stores dictionary: {'id': int, 'agent': nn, 'score': int}
+    
+    # 1. RUN ITERATIONS
+    for i in range(1, ITERATIONS + 1):
+        best_agent, best_score = train_iteration(i)
+        champions.append({
+            'id': i,
+            'agent': best_agent,
+            'score': best_score
+        })
+    
+    # 2. GENERATE FINAL SUMMARY GRAPH
+    # 
+    plot_final_summary(champions)
+
+    # 3. CALCULATE STATS
+    scores = [c['score'] for c in champions]
+    min_best = min(scores)
+    max_best = max(scores)
+    avg_best = sum(scores) / len(scores)
+    
+    print("\n" + "#"*60)
+    print("ALL TRAINING COMPLETE")
+    print("#"*60)
+    print(f"Total Iterations: {ITERATIONS}")
+    print(f"Minimum Best Score: {min_best}")
+    print(f"Maximum Best Score: {max_best}")
+    print(f"Average Best Score: {avg_best:.2f}")
+    
+    print("\nPer Iteration Breakdown:")
+    for c in champions:
+        print(f"Iter {c['id']:2d}: Score {c['score']}")
+    print("#"*60)
+    
+    # 4. UI SIMULATION LOOP
+    while True:
+        try:
+            user_input = input(f"\nEnter Iteration ID (1-{ITERATIONS}) to watch, or 'q' to quit: ").strip().lower()
+            if user_input == 'q':
+                print("Exiting...")
+                break
+            
+            iter_id = int(user_input)
+            
+            # Find the champion
+            selected_champ = next((c for c in champions if c['id'] == iter_id), None)
+            
+            if selected_champ:
+                print(f"Simulating Champion from Iteration {iter_id} (Score {selected_champ['score']})...")
+                game = SnakeGameAI(w=640, h=480, render_mode=True, display_speed_multiplier=5)
+                game.reset()
+                
+                agent = selected_champ['agent']
+                
+                while True:
+                    state = get_state(game)
+                    action = agent.predict(state)
+                    _, done, score = game.play_step(action)
+                    if done: 
+                        print(f"Game Over. Final Score: {score}")
+                        break
+            else:
+                print(f"Invalid ID. Please enter 1-{ITERATIONS}.")
+                
+        except ValueError:
+            print("Invalid input.")
+        except KeyboardInterrupt:
+            print("\nForce Quit.")
+            break
