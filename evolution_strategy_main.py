@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib
-matplotlib.use('Agg') # Non-GUI backend for saving files
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from game import SnakeGameAI, Direction, Point, BLOCK_SIZE
 from multiprocessing import Pool
@@ -11,48 +11,43 @@ import sys
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+
+# Multiprocessing, parameters and architecture settings
 NUM_PROCESSES = max(1, os.cpu_count() - 1)
+ITERATIONS = 5
+MU = 20           # Main population size
+LAMBDA = 400      # Number of offspring
+MAX_GENERATIONS = 250
+INPUT_SIZE = 24   # Input size (rays)
+HIDDEN_SIZE = 24  # Hidden layer size
+OUTPUT_SIZE = 3   # Output (directions)
 
-# Run Parameters
-ITERATIONS = 2              # Run the whole experiment 2 times (for testing)
-MU = 100                    # Parents
-LAMBDA = 400                # Children
-MAX_GENERATIONS = 500       # Gens per iteration
+# Mutation parameters
+INITIAL_SIGMA = 0.3         # Initial mutation strength
+MIN_SIGMA = 0.1             # Minimum sigma
+MAX_SIGMA = 0.6             # Maximum sigma
+TAU = 0.05                  # Sigma adaptation rate
+SPARSITY = 0.05             # Mutation rate
 
-# Architecture
-INPUT_SIZE = 24             
-HIDDEN_SIZE = 32            
-OUTPUT_SIZE = 3
-
-# === MUTATION PARAMETERS ===
-INITIAL_SIGMA = 0.3         
-MIN_SIGMA = 0.1             
-MAX_SIGMA = 0.6             
-TAU = 0.05
-SPARSITY = 0.05          
-
-# ----------------------------------------------------------
-# 1. ES NEURAL NETWORK
-# ----------------------------------------------------------
 class ESNeuralNetwork:
     def __init__(self, input_size, hidden_size, output_size):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
-        
+    # Initialize network weights
         self.weights1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
         self.bias1 = np.random.randn(1, hidden_size) * 0.01
         self.weights2 = np.random.randn(hidden_size, output_size) * np.sqrt(2.0 / hidden_size)
         self.bias2 = np.random.randn(1, output_size) * 0.01
         self.sigma = INITIAL_SIGMA
 
-    def relu(self, x): return np.maximum(0, x)
+    def relu(self, x):
+        return np.maximum(0, x)
 
     def predict(self, input_data):
-        if len(input_data.shape) == 1: input_data = input_data.reshape(1, -1)
+    # Pass input vector through network, select highest output
+        if len(input_data.shape) == 1:
+            input_data = input_data.reshape(1, -1)
         hidden = self.relu(np.dot(input_data, self.weights1) + self.bias1)
         output = np.dot(hidden, self.weights2) + self.bias2
         action = [0, 0, 0]
@@ -60,11 +55,11 @@ class ESNeuralNetwork:
         return action
 
     def es_mutate(self):
-        # 1. Adapt Sigma
+    # Update sigma adaptively
         self.sigma *= np.exp(TAU * np.random.randn())
         self.sigma = max(MIN_SIGMA, min(self.sigma, MAX_SIGMA))
 
-        # 2. Sparse "Heavy" Mutation
+    # Apply sparse mutation to network weights
         def mutate(mat):
             mask = np.random.rand(*mat.shape) < SPARSITY
             noise = np.random.randn(*mat.shape) * self.sigma
@@ -77,6 +72,7 @@ class ESNeuralNetwork:
         self.bias2 = mutate(self.bias2)
 
     def copy(self):
+    # Copy the network
         nn = ESNeuralNetwork(self.input_size, self.hidden_size, self.output_size)
         nn.weights1 = np.copy(self.weights1)
         nn.bias1 = np.copy(self.bias1)
@@ -85,33 +81,9 @@ class ESNeuralNetwork:
         nn.sigma = self.sigma
         return nn
 
-# ----------------------------------------------------------
-# 2. HELPER & STATE
-# ----------------------------------------------------------
-def calculate_flood_fill(game):
-    if len(game.snake) < 10: return 1.0
-    head = game.snake[0]
-    board_area = (game.w // BLOCK_SIZE) * (game.h // BLOCK_SIZE)
-    obstacles = set((p.x, p.y) for p in game.snake)
-    queue = deque([(head.x, head.y)])
-    visited = set([(head.x, head.y)])
-    count = 0
-    limit = board_area * 0.5 
-    moves = [(0, -BLOCK_SIZE), (0, BLOCK_SIZE), (-BLOCK_SIZE, 0), (BLOCK_SIZE, 0)]
-    while queue:
-        cx, cy = queue.popleft()
-        count += 1
-        if count > limit: return 1.0
-        for dx, dy in moves:
-            nx, ny = cx + dx, cy + dy
-            if nx < 0 or nx >= game.w or ny < 0 or ny >= game.h: continue
-            if (nx, ny) in obstacles: continue
-            if (nx, ny) not in visited:
-                visited.add((nx, ny))
-                queue.append((nx, ny))
-    return count / board_area
 
 def get_state(game):
+    # For 8 ray directions: distance, food and body info
     head = game.snake[0]
     body_set = set((p.x, p.y) for p in game.snake[1:])
     standard_angles = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]
@@ -142,6 +114,7 @@ def get_state(game):
     return np.array(state, dtype=float)
 
 def evaluate_agent(nn):
+    # Play agent, calculate fitness by score and survival time
     game = SnakeGameAI(w=640, h=480, render_mode=False) 
     game.reset()
     steps = 0
@@ -159,15 +132,9 @@ def evaluate_agent(nn):
             reward = -10
         if reward > 0:
             steps_since_eaten = 0
-            starvation_limit = 110
+            starvation_limit = 200
         if game_over: break
-        
-        # Calculate bonus while ALIVE (Correct logic)
-      #  if score > 50:
-      #      flood_fill_val = calculate_flood_fill(game)
-      #      fitness_bonus = (score ** 3) * (flood_fill_val * 0.1)
-
-    fitness = (score ** 3) + (steps * 0.001) #+ fitness_bonus
+    fitness = (score ** 3) + (steps * 0.001)
     return max(0.1, fitness), score
 
 def evaluate_agent_wrapper(nn): return evaluate_agent(nn)
@@ -218,19 +185,21 @@ def plot_final_summary(champions):
     print(f"   [Summary Graph Saved]: es_final_summary_scores.png")
 
 # ----------------------------------------------------------
-# 3. TRAINING LOOP FOR ONE ITERATION
+# TRAINING LOOP FOR ONE ITERATION
 # ----------------------------------------------------------
 def train_iteration(iteration_id):
     print(f"\n" + "="*50)
     print(f"STARTING ES ITERATION {iteration_id} / {ITERATIONS}")
     print(f"Strategy: MU+LAMBDA | Min Sigma {MIN_SIGMA}")
     print("="*50)
-    
+
+    # Initialize main population
     parents_list = [ESNeuralNetwork(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE) for _ in range(MU)]
-    
+
+    # Evaluate initial population
     with Pool(processes=NUM_PROCESSES) as pool:
         results = pool.map(evaluate_agent_wrapper, parents_list)
-    
+
     population_data = []
     for i, agent in enumerate(parents_list):
         population_data.append({'agent': agent, 'fitness': results[i][0], 'score': results[i][1]})
@@ -239,13 +208,12 @@ def train_iteration(iteration_id):
     all_time_best_agent = None
     stagnation = 0
 
-    # Data Collection for Graphing
     gen_history = []
     best_history = []
     avg_history = []
 
     for gen in range(1, MAX_GENERATIONS + 1):
-        # 1. Offspring
+    # Generate offspring
         offspring_agents = []
         for _ in range(LAMBDA):
             parent_data = np.random.choice(population_data)
@@ -253,29 +221,28 @@ def train_iteration(iteration_id):
             child.es_mutate()
             offspring_agents.append(child)
 
-        # 2. Evaluate
+    # Evaluate offspring
         with Pool(processes=NUM_PROCESSES) as pool:
             results = pool.map(evaluate_agent_wrapper, offspring_agents)
-        
+
         offspring_data = []
         for i, agent in enumerate(offspring_agents):
             offspring_data.append({'agent': agent, 'fitness': results[i][0], 'score': results[i][1]})
 
-        # 3. Selection (Mu + Lambda)
+    # Select best MU agents
         combined = population_data + offspring_data
         combined.sort(key=lambda x: x['fitness'], reverse=True)
         population_data = combined[:MU]
-        
-        # 4. Stats
+
+    # Save statistics
         current_best = population_data[0]
         current_best_score = current_best['score']
         avg_gen_score = sum(p['score'] for p in population_data) / MU
 
-        # Save History
         gen_history.append(gen)
         best_history.append(current_best_score)
         avg_history.append(avg_gen_score)
-        
+
         if current_best_score > all_time_best_score:
             all_time_best_score = current_best_score
             all_time_best_agent = current_best['agent'].copy()
@@ -284,20 +251,14 @@ def train_iteration(iteration_id):
         else:
             stagnation += 1
 
-        # 5. NUCLEAR RADIATION (Disabled per your request, but code kept for reference)
-        """ if stagnation > 20:
-             ... logic ...
-        """
-    
+    # Print status every 10 generations
         if gen % 10 == 0:
-             print(f"Iter {iteration_id} | Gen {gen:3d} | Best: {current_best_score:3d} | Avg: {avg_gen_score:.2f} | Sigma: {population_data[0]['agent'].sigma:.3f}")
+            print(f"Iter {iteration_id} | Gen {gen:3d} | Best: {current_best_score:3d} | Avg: {avg_gen_score:.2f} | Sigma: {population_data[0]['agent'].sigma:.3f}")
 
     print(f"-> Iteration {iteration_id} Finished. Best Score: {all_time_best_score}")
-    
-    # Generate Graph for this iteration
-    
+
     plot_iteration_results(iteration_id, gen_history, best_history, avg_history)
-    
+
     return all_time_best_agent, all_time_best_score
 
 # ----------------------------------------------------------

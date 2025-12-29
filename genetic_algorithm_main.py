@@ -17,9 +17,9 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 NUM_PROCESSES = max(1, os.cpu_count() - 1)
 
 # Run Parameters
-ITERATIONS = 2             # Number of separate training sessions
-POPULATION_SIZE = 500          
-MAX_GENERATIONS = 500       # Generations per iteration
+ITERATIONS = 5
+POPULATION_SIZE = 500
+MAX_GENERATIONS = 250
 ELITISM_SELECTION_PERCENT = 0.024
 
 # Evolution Strategy Hyperparameters
@@ -33,7 +33,7 @@ HIDDEN_SIZE = 16
 OUTPUT_SIZE = 3        
 
 # ----------------------------------------------------------
-# 1. NEURAL NETWORK
+# NEURAL NETWORK
 # ----------------------------------------------------------
 class NeuralNetwork:
     def __init__(self, input_size, hidden_size, output_size):
@@ -179,15 +179,11 @@ def evaluate_agent(nn):
             reward = -10 
         if reward > 0:
             steps_since_eaten = 0
-            starvation_limit = 200 # FIXED: Corrected starvation logic
+            starvation_limit = 200
         if game_over: break
 
-        fitness_bonus = 0
-      #  if score>50:
-      #      flood_fill_val = calculate_flood_fill(game)
-      #      fitness_bonus = (score ** 3) * (flood_fill_val * 0.1)
 
-    return (score ** 3) + (steps_total * 0.001), score #+ fitness_bonus, score
+    return (score ** 3) + (steps_total * 0.001), score
 
 def eval_wrapper(nn): return evaluate_agent(nn)
 
